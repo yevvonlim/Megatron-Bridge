@@ -31,7 +31,7 @@ exclude = [
 ]
 
 # Files to completely ignore
-extend-exclude = ["*.ipynb"]
+extend-exclude = ["*.ipynb", "tests/unit_tests/models/step3p5/_reference/**"]
 
 [lint]
 # Configure imports sorting to match isort

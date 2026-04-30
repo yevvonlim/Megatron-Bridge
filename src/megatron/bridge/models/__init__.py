@@ -149,6 +149,11 @@ from megatron.bridge.models.sarvam import (
     SarvamMLABridge,
     SarvamMoEBridge,
 )
+from megatron.bridge.models.step3p5 import (
+    Step3p5ModelBridge,
+    Step3p5ModelProvider,
+    Step3p5ModelProviderMini3B,
+)
 from megatron.bridge.models.t5_provider import T5ModelProvider
 
 
@@ -245,4 +250,8 @@ __all__ = [
     "Qwen25OmniModelProvider",
     "SarvamMLABridge",
     "SarvamMoEBridge",
+    # Step-3.5 Models
+    "Step3p5ModelBridge",
+    "Step3p5ModelProvider",
+    "Step3p5ModelProviderMini3B",
 ]
