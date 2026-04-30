@@ -224,6 +224,7 @@ class Step3p5ModelProvider(GPTModelProvider):
             llama3_low_freq_factor=self.llama3_low_freq_factor,
             llama3_high_freq_factor=self.llama3_high_freq_factor,
             llama3_original_max_pe=self.llama3_original_max_pe,
+            rotary_interleaved=self.rotary_interleaved,
         )
         model.rotary_pos_emb = rope_module
         # Stash the module on the config so Step3p5SelfAttention can read

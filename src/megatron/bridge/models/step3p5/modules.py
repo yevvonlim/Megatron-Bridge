@@ -47,6 +47,10 @@ import math
 from typing import Optional, Tuple
 
 import torch
+from megatron.core import parallel_state
+from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -156,6 +160,7 @@ class Step3p5RotaryEmbedding(nn.Module):
         llama3_low_freq_factor: float,
         llama3_high_freq_factor: float,
         llama3_original_max_pe: int,
+        rotary_interleaved: bool = False,
     ) -> None:
         super().__init__()
         if len(rope_theta_cycle) != len(partial_rotary_cycle):
@@ -165,11 +170,11 @@ class Step3p5RotaryEmbedding(nn.Module):
             )
         self.num_slots = len(rope_theta_cycle)
         self.kv_channels = kv_channels
+        self.rotary_interleaved = rotary_interleaved
 
         # Per-slot rotary dim and inv_freq.
         rotary_dims: list[int] = []
         inv_freqs: list[torch.Tensor] = []
-        attention_scalings: list[float] = []
         for slot_idx, (theta, partial_factor) in enumerate(zip(rope_theta_cycle, partial_rotary_cycle, strict=True)):
             rotary_dim = int(kv_channels * partial_factor)
             if rotary_dim % 2 != 0:
@@ -192,56 +197,77 @@ class Step3p5RotaryEmbedding(nn.Module):
             else:
                 inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
                 scale = 1.0
+            if scale != 1.0:
+                # Step3p5RotaryEmbedding emits *freqs* (not cos/sin), so a non-unit
+                # attention_scaling cannot be folded into the freqs without changing
+                # what apply_rotary_pos_emb computes. HF llama3 returns 1.0 here.
+                raise NotImplementedError(
+                    f"Slot {slot_idx} requested attention_scaling={scale}; only 1.0 is "
+                    "currently supported by the Step3p5 rotary module."
+                )
             inv_freqs.append(inv_freq)
-            attention_scalings.append(scale)
 
         self.rotary_dims = tuple(rotary_dims)
         self.max_rotary_dim = max(rotary_dims)
-        # Register inv_freq buffers per slot. We pad shorter slots with NaN so the
-        # stack has uniform last-dim; callers must slice to the per-slot rotary_dim.
         for i, inv_freq in enumerate(inv_freqs):
             self.register_buffer(f"inv_freq_{i}", inv_freq, persistent=False)
-        self.register_buffer(
-            "attention_scaling",
-            torch.tensor(attention_scalings, dtype=torch.float32),
-            persistent=False,
-        )
 
     def _inv_freq(self, slot: int) -> torch.Tensor:
         return getattr(self, f"inv_freq_{slot}")
 
-    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
-        """Return a stacked cos/sin tensor.
+    def _slot_emb(self, slot: int, max_seq_len: int, offset: int) -> Tensor:
+        """Build the per-slot freqs tensor in MCore's standard layout.
 
-        The returned tensor has shape ``(num_slots, max_seq_len,
-        max_rotary_dim)`` for cos and sin, packed as ``(2, num_slots,
-        ...)`` along a leading axis. Callers index slot first.
-
-        Slots whose ``rotary_dim`` is smaller than ``max_rotary_dim`` are
-        zero-padded on the trailing dim; ``Step3p5SelfAttention`` is
-        responsible for slicing back to the slot's true ``rotary_dim``.
+        Returns shape ``[seq, 1, 1, slot_rotary_dim]`` -- the ``freqs`` format
+        that :func:`apply_rotary_pos_emb` consumes (cos/sin is computed inside
+        the apply_* kernels). Mirrors :meth:`RotaryEmbedding.get_emb`.
         """
-        positions = torch.arange(offset, offset + max_seq_len, dtype=torch.float32, device=self._inv_freq(0).device)
-        cos_per_slot: list[torch.Tensor] = []
-        sin_per_slot: list[torch.Tensor] = []
+        inv_freq = self._inv_freq(slot)
+        if inv_freq.device.type == "cpu" and torch.cuda.is_available():
+            inv_freq = inv_freq.to(device=torch.cuda.current_device())
+            self.register_buffer(f"inv_freq_{slot}", inv_freq, persistent=False)
+        positions = torch.arange(offset, offset + max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
+        freqs = torch.outer(positions, inv_freq)  # [seq, slot_rotary_dim/2]
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(freqs.shape[0], -1)
+        return emb[:, None, None, :]  # [seq, 1, 1, slot_rotary_dim]
+
+    def forward(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
+        """Return per-slot freqs stacked along a leading axis.
+
+        Output shape ``[num_slots, seq, 1, 1, max_rotary_dim]`` -- each slot is
+        zero-padded on the trailing dim to ``max_rotary_dim``. Consumers
+        (:class:`Step3p5SelfAttention`) pick a slot via
+        ``(layer_number - 1) % num_slots`` and slice the trailing zero-pad to
+        the slot's true ``rotary_dim`` before passing as ``rotary_pos_emb``.
+
+        ``packed_seq=True`` skips CP slicing along the seq dim; the THD apply
+        kernel handles CP later.
+        """
+        if cp_group is None:
+            cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
+        per_slot: list[Tensor] = []
         for slot in range(self.num_slots):
-            inv_freq = self._inv_freq(slot)
-            freqs = torch.outer(positions, inv_freq)
-            emb = torch.cat([freqs, freqs], dim=-1)
-            scaling = float(self.attention_scaling[slot])
-            cos = emb.cos() * scaling
-            sin = emb.sin() * scaling
-            # Zero-pad to max_rotary_dim so we can stack.
-            if cos.shape[-1] < self.max_rotary_dim:
-                pad = self.max_rotary_dim - cos.shape[-1]
-                cos = torch.nn.functional.pad(cos, (0, pad))
-                sin = torch.nn.functional.pad(sin, (0, pad))
-            cos_per_slot.append(cos)
-            sin_per_slot.append(sin)
-        cos_stack = torch.stack(cos_per_slot, dim=0)
-        sin_stack = torch.stack(sin_per_slot, dim=0)
-        # Pack as (2, num_slots, seq, max_rotary_dim).
-        return torch.stack([cos_stack, sin_stack], dim=0)
+            emb = self._slot_emb(slot, max_seq_len, offset)
+            slot_rot_dim = self.rotary_dims[slot]
+            if slot_rot_dim < self.max_rotary_dim:
+                emb = torch.nn.functional.pad(emb, (0, self.max_rotary_dim - slot_rot_dim))
+            if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+                emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            per_slot.append(emb)
+        return torch.stack(per_slot, dim=0)
+
+    # Delegate to upstream — the body is independent of self state, so the unbound
+    # method works correctly when bound to a Step3p5RotaryEmbedding instance.
+    get_rotary_seq_len = RotaryEmbedding.get_rotary_seq_len
 
 
 class Step3p5SelfAttention(SelfAttention):
@@ -265,12 +291,16 @@ class Step3p5SelfAttention(SelfAttention):
         submodules,
         layer_number: int,
         attn_mask_type: AttnMaskType,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        **kwargs,
     ) -> None:
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
+            pg_collection=pg_collection,
+            **kwargs,
         )
         if not getattr(config, "head_wise_attn_gate", False):
             self.head_gate = None
@@ -294,6 +324,37 @@ class Step3p5SelfAttention(SelfAttention):
             tp_comm_buffer_name="head_gate",
         )
 
+        # The HF reference applies the per-head gate BEFORE ``o_proj``
+        # (modeling_step3p5.py:527-531). MCore's ``Attention.forward`` calls
+        # ``self.linear_proj`` internally, so we splice the gate in by
+        # monkey-patching ``self.linear_proj.forward`` to read a
+        # gate-logits tensor stashed on ``self`` at the start of forward.
+        # Keeping the patch on the bound method preserves the original module's
+        # parameters, hooks, and state_dict paths.
+        self._cached_gate_logits: Optional[Tensor] = None
+        self._head_dim = config.kv_channels
+        original_proj_forward = self.linear_proj.forward
+
+        def _gated_linear_proj_forward(x, *args, **kwargs):
+            gate_logits = self._cached_gate_logits
+            if gate_logits is not None:
+                # x is the pre-o_proj activation. Standard path: (sq, b, n_heads_per_tp * head_dim).
+                # THD packed: (t, 1, n_heads_per_tp * head_dim).
+                n_heads_per_tp = self.num_attention_heads_per_partition
+                hidden_per_tp = n_heads_per_tp * self._head_dim
+                assert x.shape[-1] == hidden_per_tp, (
+                    f"Step3p5 gated linear_proj expected last-dim {hidden_per_tp}, got {x.shape[-1]}"
+                )
+                gate = torch.sigmoid(gate_logits.float()).to(x.dtype)
+                leading = x.shape[:-1]
+                x = x.reshape(*leading, n_heads_per_tp, self._head_dim)
+                x = x * gate.reshape(*gate.shape, 1)
+                x = x.reshape(*leading, hidden_per_tp).contiguous()
+                self._cached_gate_logits = None
+            return original_proj_forward(x, *args, **kwargs)
+
+        self.linear_proj.forward = _gated_linear_proj_forward
+
     def _rope_slot_index(self) -> int:
         period = len(getattr(self.config, "rope_theta_cycle", (1,)))
         return (self.layer_number - 1) % period
@@ -315,48 +376,48 @@ class Step3p5SelfAttention(SelfAttention):
         inference_params=None,
     ) -> Tuple[Tensor, Tensor]:
         """Forward with per-layer RoPE slot and per-head output gate."""
-        # Pick this layer's rope slot from the stacked rope tensor.
-        if rotary_pos_emb is not None and rotary_pos_emb.ndim >= 3 and rotary_pos_emb.size(0) == 2:
-            # Shape (2, num_slots, seq, max_rotary_dim) -> select slot.
+        # Step3p5RotaryEmbedding emits a stacked freqs tensor of shape
+        # [num_slots, seq, 1, 1, max_rotary_dim]. Slice this layer's slot and
+        # trim the trailing zero-pad to the slot's true rotary_dim.
+        if rotary_pos_emb is not None and rotary_pos_emb.ndim == 5:
             slot = self._rope_slot_index()
-            rotary_pos_cos = rotary_pos_emb[0, slot]
-            rotary_pos_sin = rotary_pos_emb[1, slot]
-            # Slice trailing zero-padding for the slot's true rotary_dim.
             module_rope = self.config._step3p5_rotary_module
-            rotary_dim = module_rope.rotary_dims[slot]
-            if rotary_dim < module_rope.max_rotary_dim:
-                rotary_pos_cos = rotary_pos_cos[..., :rotary_dim]
-                rotary_pos_sin = rotary_pos_sin[..., :rotary_dim]
-            rotary_pos_emb = None
+            slot_rot_dim = module_rope.rotary_dims[slot]
+            slot_emb = rotary_pos_emb[slot]
+            if slot_rot_dim < module_rope.max_rotary_dim:
+                slot_emb = slot_emb[..., :slot_rot_dim]
+            # apply_rotary_pos_emb's fused/unfused kernels assume contiguous freqs.
+            rotary_pos_emb = slot_emb.contiguous()
+        # Always clear the inference-only cos/sin path -- upstream SelfAttention
+        # asserts they are None outside flash-decode / flashinfer rope.
+        rotary_pos_cos = None
+        rotary_pos_sin = None
 
-        # Compute head-gate logits from the SAME hidden_states feeding q/k/v_proj.
-        gate_logits = None
+        # Compute head-gate logits from the SAME hidden_states feeding q/k/v_proj
+        # and stash on self -- the patched ``self.linear_proj.forward`` reads them
+        # and applies the gate to the pre-o_proj activation (mirrors HF semantics).
         if self.head_gate is not None:
             gate_out, _ = self.head_gate(hidden_states)
-            gate_logits = gate_out  # shape: (seq, batch, n_heads_per_tp)
+            self._cached_gate_logits = gate_out  # (seq, batch, n_heads_per_tp)
 
-        attn_output, attn_bias = super().forward(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            key_value_states=key_value_states,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            inference_params=inference_params,
-        )
-
-        if gate_logits is not None:
-            # attn_output is (seq, batch, hidden_per_tp = n_heads_per_tp * head_dim)
-            seq, batch, hidden_per_tp = attn_output.shape
-            n_heads_per_tp = gate_logits.shape[-1]
-            head_dim = hidden_per_tp // n_heads_per_tp
-            gate = torch.sigmoid(gate_logits).to(attn_output.dtype)
-            attn_output = attn_output.view(seq, batch, n_heads_per_tp, head_dim) * gate.unsqueeze(-1)
-            attn_output = attn_output.view(seq, batch, hidden_per_tp)
+        try:
+            attn_output, attn_bias = super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                key_value_states=key_value_states,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                inference_params=inference_params,
+            )
+        finally:
+            # Make sure a stale gate doesn't leak into a later call if super
+            # raised before consuming it.
+            self._cached_gate_logits = None
 
         return attn_output, attn_bias
 
@@ -421,6 +482,9 @@ class Step3p5MLP(MLP):
                 "Step3p5MLP requires bias_activation_fusion=False because the asymmetric "
                 "SwiGLU clamp cannot be expressed inside the fused activation kernel."
             )
+        # Upstream MLP no longer stores `is_expert` as an attribute; capture it here
+        # so :meth:`_resolve_clamp_value` can pick the right clamp list.
+        self.is_expert = bool(kwargs.get("is_expert", False))
         super().__init__(config=config, submodules=submodules, **kwargs)
 
     def _resolve_clamp_value(self) -> Optional[float]:
@@ -436,11 +500,11 @@ class Step3p5MLP(MLP):
         # to both code paths (modeling_step3p5.py:559,572,577).
         return float(self.config.shared_swiglu_clamp_value) if layer_idx_0 in shared_layers else None
 
-    def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, hidden_states: Tensor, *args, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward with optional gate/up clamp before the elementwise multiply."""
         clamp = self._resolve_clamp_value()
         if clamp is None:
-            return super().forward(hidden_states)
+            return super().forward(hidden_states, *args, **kwargs)
 
         # Replicate the Megatron MLP forward but interpose the clamp between the
         # gate/up split and the activation. The fused-bias path is forbidden in
