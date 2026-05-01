@@ -161,9 +161,9 @@ class Step3p5ModelBridge(MegatronModelBridge):
 
         # Sequence length / max position embeddings.
         provider.seq_length = int(getattr(hf_config, "max_seq_len", provider.seq_length))
-        provider.max_position_embeddings = int(
-            getattr(hf_config, "max_position_embeddings", provider.max_position_embeddings)
-        )
+        max_pe = getattr(hf_config, "max_position_embeddings", None)
+        if max_pe is not None:
+            provider.max_position_embeddings = int(max_pe)
 
         return provider
 
@@ -251,7 +251,19 @@ class Step3p5ModelBridge(MegatronModelBridge):
         converted_weights_dict: Dict[str, torch.Tensor],
         hf_state_dict: Mapping[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Rename synthesized fused export keys back to real HF names."""
+        """Rename synthesized fused export keys back to real HF names.
+
+        Two synthetic-key shapes appear during export:
+
+        1. Per-expert results from ``FusedGatedExpertMapping.megatron_to_hf``,
+           keyed as ``<...>.moe.gate_up_proj_fused.gate`` / ``...up`` with
+           shape ``(intermediate, hidden)``. Split into the real HF names.
+        2. Grouped/merged result yielded by the grouped-export accumulator,
+           keyed as ``<...>.moe.gate_up_proj_fused`` with shape
+           ``(num_experts, 2*intermediate, hidden)``. Split along dim 1 into
+           ``moe.gate_proj.weight`` and ``moe.up_proj.weight`` (each
+           ``(num_experts, intermediate, hidden)``).
+        """
         synthetic_keys = [k for k in list(converted_weights_dict.keys()) if _GATE_UP_FUSED_SUFFIX in k]
         if not synthetic_keys:
             return converted_weights_dict
@@ -259,17 +271,27 @@ class Step3p5ModelBridge(MegatronModelBridge):
         renamed: Dict[str, torch.Tensor] = {}
         for k in synthetic_keys:
             tensor = converted_weights_dict.pop(k)
-            # `FusedGatedExpertMapping.megatron_to_hf` returns dict with keys
-            # `<hf_param>.gate` / `<hf_param>.up` (where hf_param ends with
-            # `_GATE_UP_FUSED_SUFFIX`). Map them back to the real HF names.
             if k.endswith(".gate"):
+                # Pre-merge per-expert gate half.
                 base = k[: -len(".gate")]
                 layer_prefix = base[: -len(_GATE_UP_FUSED_SUFFIX)]
                 renamed[f"{layer_prefix}.moe.gate_proj.weight"] = tensor
             elif k.endswith(".up"):
+                # Pre-merge per-expert up half.
                 base = k[: -len(".up")]
                 layer_prefix = base[: -len(_GATE_UP_FUSED_SUFFIX)]
                 renamed[f"{layer_prefix}.moe.up_proj.weight"] = tensor
+            elif k.endswith(_GATE_UP_FUSED_SUFFIX):
+                # Post-merge stacked tensor (num_experts, 2*intermediate, hidden).
+                # Split the fused dim into gate / up halves.
+                if tensor.ndim != 3:
+                    raise ValueError(f"Expected 3D merged expert tensor for {k}; got shape {tuple(tensor.shape)}.")
+                if tensor.shape[1] % 2 != 0:
+                    raise ValueError(f"Expected even fused intermediate dim for {k}; got shape {tuple(tensor.shape)}.")
+                gate, up = torch.chunk(tensor, 2, dim=1)
+                layer_prefix = k[: -len(_GATE_UP_FUSED_SUFFIX)]
+                renamed[f"{layer_prefix}.moe.gate_proj.weight"] = gate.contiguous()
+                renamed[f"{layer_prefix}.moe.up_proj.weight"] = up.contiguous()
             else:
                 logger.warning("Unexpected synthetic key during export: %s", k)
                 renamed[k] = tensor

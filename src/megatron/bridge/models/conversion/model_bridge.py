@@ -921,7 +921,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         _hf_import_cache: Dict[str, torch.Tensor] = {}
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
-            if task.megatron_module is None:
+            if task is None or task.megatron_module is None:
                 continue
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)
@@ -1152,6 +1152,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
         _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
 
         for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
+            if task is None:
+                continue
             if isinstance(task.param_weight, DTensor):
                 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                     uneven_dtensor_to_full_tensor,
@@ -1189,6 +1191,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                     task, converted_weights_dict, model_config, _grouped_buffers, hf_state_dict
                 )
                 if merged_result is not None:
+                    # Allow the bridge to rename / split synthetic group keys
+                    # (e.g. Step3p5 splits gate_up_proj_fused into gate/up halves).
+                    merged_result = self.maybe_modify_converted_hf_weight(
+                        task, merged_result, hf_state_dict
+                    )
                     for hf_name, tensor in merged_result.items():
                         yield HFWeightTuple(hf_name, tensor.cpu() if cpu else tensor)
                 continue

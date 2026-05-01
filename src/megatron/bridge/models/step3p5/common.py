@@ -45,8 +45,10 @@ def _base_layer_mappings(layer_prefix_megatron: str, layer_prefix_hf: str) -> li
     blocks (which share the per-layer parameter shape).
     """
     autos = {
-        # input layer norm (always standalone, since linear_qkv is TE-fused-LN-fc1)
-        f"{layer_prefix_megatron}.input_layernorm.weight": f"{layer_prefix_hf}.input_layernorm.weight",
+        # input layer norm: TE-fused into linear_qkv on every layer (dense and MoE)
+        f"{layer_prefix_megatron}.self_attention.linear_qkv.layer_norm_weight": (
+            f"{layer_prefix_hf}.input_layernorm.weight"
+        ),
         # attention output proj
         f"{layer_prefix_megatron}.self_attention.linear_proj.weight": (f"{layer_prefix_hf}.self_attn.o_proj.weight"),
         # qk norm (per-head; weight is head_dim-sized)

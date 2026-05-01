@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.recipes.step3p5.step3p5_mini import step3p5_mini_3b_pretrain_config
+from megatron.bridge.recipes.step3p5.step3p5_mini import (
+    step3p5_mini_3b_muon_pretrain_config,
+    step3p5_mini_3b_pretrain_config,
+)
 
 
-__all__ = ["step3p5_mini_3b_pretrain_config"]
+__all__ = [
+    "step3p5_mini_3b_pretrain_config",
+    "step3p5_mini_3b_muon_pretrain_config",
+]

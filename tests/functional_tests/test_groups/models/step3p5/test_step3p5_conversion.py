@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 
-_REFERENCE_DIR = Path(__file__).resolve().parents[3] / "unit_tests" / "models" / "step3p5" / "_reference"
+_REFERENCE_DIR = Path(__file__).resolve().parents[4] / "unit_tests" / "models" / "step3p5" / "_reference"
 
 
 HF_STEP3P5_TOY_CONFIG = {
@@ -67,6 +67,13 @@ HF_STEP3P5_TOY_CONFIG = {
     },
     "yarn_only_types": ["full_attention"],
     "partial_rotary_factors": [0.5, 1.0, 1.0, 1.0],
+    # Sliding layers consult attention_other_setting at build time even when
+    # heads are uniform. Mirror the base values so the heterogeneous-heads
+    # guard in Step3p5ModelBridge accepts the config.
+    "attention_other_setting": {
+        "num_attention_heads": 8,
+        "num_attention_groups": 4,
+    },
     # MoE config (small).
     "use_moe": True,
     "moe_num_experts": 4,

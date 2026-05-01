@@ -179,7 +179,12 @@ class PreTrainedBase(ABC):
         # Iterate over required artifacts to save them in a predictable order
         for name in self.ARTIFACTS:
             # Access the public property to trigger lazy loading if needed
-            artifact = getattr(self, name)
+            try:
+                artifact = getattr(self, name)
+            except (ValueError, OSError, ImportError):
+                # Some artifacts (e.g., tokenizer for non-registered model_types)
+                # cannot be loaded; skip silently rather than fail the save.
+                continue
             attr_name = f"_{name}"
             if hasattr(self, attr_name):
                 if artifact is not None and hasattr(artifact, "save_pretrained"):

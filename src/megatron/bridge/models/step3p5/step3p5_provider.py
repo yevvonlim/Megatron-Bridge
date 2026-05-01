@@ -31,15 +31,12 @@ import torch
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.transformer import (
     ModuleSpec,
-    TransformerLayer,
-    TransformerLayerSubmodules,
 )
-from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.mlp import MLPSubmodules
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.step3p5.modules import (
+    Step3p5GroupedMLP,
     Step3p5MLP,
     Step3p5RotaryEmbedding,
     Step3p5SelfAttention,
@@ -59,42 +56,54 @@ TEColumnParallelLinear, _ = safe_import_from("megatron.core.extensions.transform
 TERowParallelLinear, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TERowParallelLinear")
 
 
-def step3p5_layer_spec(config: "Step3p5ModelProvider") -> ModuleSpec:
-    """Step-3.5-Flash decoder layer spec.
+def step3p5_layer_spec(config: "Step3p5ModelProvider", vp_stage=None):
+    """Step-3.5-Flash decoder block spec with per-layer dense vs MoE.
 
-    Static spec (called once for the whole stack); per-layer behavior --
-    sliding vs full attention, swiglu clamp -- is decided at *runtime* by
-    :class:`Step3p5SelfAttention` / :class:`Step3p5TEDotProductAttention`
-    / :class:`Step3p5MLP` reading ``self.layer_number`` and the per-layer
-    config tuples. MCore's spec function is invoked only once.
+    Builds on Megatron-Core's :func:`get_gpt_decoder_block_spec`, which honors
+    ``config.moe_layer_freq`` and produces a list of per-layer specs (dense
+    layers get a stock ``MLP``; MoE layers get a ``MoELayer`` with grouped-GEMM
+    routed experts and a separate ``SharedExpertMLP``). We then patch in the
+    Step-3.5 attention overrides on every layer and swap ``MLP -> Step3p5MLP``
+    on dense layers so the SwiGLU clamp on the dense path still fires at
+    runtime.
+
+    Per-layer behavior (sliding vs full attention, head-gate, per-slot rope) is
+    still runtime-decided via ``self.layer_number`` inside
+    :class:`Step3p5SelfAttention` / :class:`Step3p5TEDotProductAttention`.
+
+    Routed-expert SwiGLU clamp is wired by replacing the experts module in MoE
+    layer specs with :class:`Step3p5GroupedMLP`. The grouped experts module
+    does not receive ``layer_number`` natively, so the provider's ``provide``
+    method assigns it after MoE-layer construction.
+
+    Shared-expert SwiGLU clamp (``shared_swiglu_clamp_layers``) is not yet
+    wired through ``SharedExpertMLP`` and will need a follow-up to apply
+    identically to the HF reference. The dense-path clamp works correctly
+    today.
     """
-    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
 
-    return ModuleSpec(
-        module=TransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=Step3p5SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=Step3p5TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
-                    q_layernorm=TENorm if config.qk_layernorm else None,
-                    k_layernorm=TENorm if config.qk_layernorm else None,
-                ),
-            ),
-            self_attn_bda=get_bias_dropout_add,
-            mlp=ModuleSpec(
-                module=Step3p5MLP,
-                submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
-                ),
-            ),
-            mlp_bda=get_bias_dropout_add,
-        ),
-    )
+    block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True, vp_stage=vp_stage)
+
+    for layer_spec in block_spec.layer_specs:
+        # Step-3.5 attention overrides apply to every layer (dense and MoE).
+        layer_spec.submodules.self_attention.module = Step3p5SelfAttention
+        layer_spec.submodules.self_attention.params = {"attn_mask_type": AttnMaskType.causal}
+        layer_spec.submodules.self_attention.submodules.core_attention = Step3p5TEDotProductAttention
+        # SwiGLU clamp on dense layers -- swap stock MLP -> Step3p5MLP.
+        if layer_spec.submodules.mlp.module is MLP:
+            layer_spec.submodules.mlp.module = Step3p5MLP
+        # SwiGLU clamp on routed experts -- swap TEGroupedMLP -> Step3p5GroupedMLP.
+        # Guard on the parent class so future Megatron-Core spec changes (e.g. a
+        # different default experts module) don't silently break us.
+        mlp_submods = getattr(layer_spec.submodules.mlp, "submodules", None)
+        experts_spec = getattr(mlp_submods, "experts", None) if mlp_submods is not None else None
+        if experts_spec is not None and getattr(experts_spec, "module", None) is TEGroupedMLP:
+            experts_spec.module = Step3p5GroupedMLP
+
+    return block_spec
 
 
 @dataclass
@@ -137,6 +146,27 @@ class Step3p5ModelProvider(GPTModelProvider):
     shared_swiglu_clamp_layers: Tuple[int, ...] = ()
     shared_swiglu_clamp_value: float = 16.0
 
+    # Per-MoE-layer expert-norm dispersion logging (paper §4.1.3 / Appendix B).
+    # Off by default; enable in pretraining recipes to surface Muon-induced
+    # rogue-expert pathology that training loss alone cannot detect.
+    enable_moe_dispersion_logging: bool = False
+    moe_dispersion_log_every: int = 50
+
+    # Step-3.5 §3.2: route 3D grouped-expert weights to Muon. Default on so
+    # provide() tags them via :func:`mark_3d_experts_for_muon`. Tagging is
+    # harmless if the active optimizer is not ``muon_step3p5``.
+    route_3d_experts_to_muon: bool = True
+
+    # Mid-training / SFT / RL recipes (Step-3.5 §6) freeze the router. Default
+    # off (pretraining keeps the router trainable).
+    freeze_router: bool = False
+
+    # Step-3.5 §2.2 eq. (1) per-EP-group balance loss coefficient. 0 = off.
+    # Paper recommends 1e-3. Computed locally per rank; differs from
+    # ``moe_aux_loss_coeff`` (per-expert) and ``global_aux_loss`` (TP+DP+CP-
+    # reduced) by being explicitly per-EP-group.
+    ep_group_balance_loss_coeff: float = 0.0
+
     # ---- rope ------------------------------------------------------------
     position_embedding_type: str = "rope"
     apply_rope_fusion: bool = False  # per-layer rope variation -> no fused kernel
@@ -155,6 +185,9 @@ class Step3p5ModelProvider(GPTModelProvider):
     moe_router_load_balancing_type: str = "seq_aux_loss"
     moe_aux_loss_coeff: float = 1e-3
     moe_shared_expert_overlap: bool = True
+    # Step-3.5's share_expert in HF has only down/gate/up (no shared-expert gate weight).
+    # TransformerConfig defaults moe_shared_expert_gate=False which is what we want;
+    # we don't redeclare so dataclass inheritance stays clean.
     moe_permute_fusion: bool = True
 
     # explicitly OFF -- not the per-Q-feature gate from Qwen3-Next
@@ -213,6 +246,8 @@ class Step3p5ModelProvider(GPTModelProvider):
         # replace it below), but the constructor must not crash. Pin
         # rotary_percent=1.0; our custom rope handles per-slot partial.
         self.rotary_percent = 1.0
+        if isinstance(self.rotary_base, (list, tuple)):
+            self.rotary_base = float(self.rotary_base[0])
         model = super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
 
         rope_module = Step3p5RotaryEmbedding(
@@ -233,6 +268,52 @@ class Step3p5ModelProvider(GPTModelProvider):
 
         if hasattr(model, "embedding") or hasattr(model, "output_layer"):
             model.setup_embeddings_and_output_layer()
+
+        # Wire layer_number onto each MoE layer's grouped-experts module so the
+        # Step3p5GroupedMLP override can decide per-layer whether to apply the
+        # routed SwiGLU clamp. TEGroupedMLP doesn't accept layer_number through
+        # its constructor; the outer TransformerLayer / MoELayer carry it as an
+        # attribute, which we propagate here.
+        decoder = getattr(model, "decoder", None)
+        if decoder is not None and hasattr(decoder, "layers"):
+            for layer in decoder.layers:
+                mlp = getattr(layer, "mlp", None)
+                experts = getattr(mlp, "experts", None) if mlp is not None else None
+                if isinstance(experts, Step3p5GroupedMLP):
+                    experts.layer_number = getattr(layer, "layer_number", None)
+
+        # Step-3.5 §3.2: paper applies Muon to all 2D matrices including the per-
+        # expert routed weights. Megatron-Core's grouped-experts store those as
+        # 3D ``(E, M, H)`` tensors; tag them so the Muon routing predicate
+        # registered by ``muon_patches.register_step3p5_muon`` permits them
+        # through to the Muon param group. Tagging is harmless when the
+        # ``muon_step3p5`` optimizer is not selected (the attribute is just
+        # ignored). Optional knob :attr:`route_3d_experts_to_muon` lets users
+        # opt out; defaulting on matches the paper.
+        if getattr(self, "route_3d_experts_to_muon", True):
+            from megatron.bridge.models.step3p5 import muon_patches
+
+            muon_patches.mark_3d_experts_for_muon(model)
+
+        # Optional: freeze the MoE router (Step-3.5 mid-training / SFT recipe).
+        # Pretraining keeps router trainable.
+        if getattr(self, "freeze_router", False):
+            for name, p in model.named_parameters():
+                if name.endswith("mlp.router.weight") or name.endswith("router.weight"):
+                    p.requires_grad_(False)
+
+        # Step-3.5 §2.2 per-EP-group balance loss: opt-in via coefficient > 0.
+        # Skipped silently when expert_model_parallel_size <= 1 since "EP groups"
+        # is degenerate without EP sharding.
+        ep_size = int(getattr(self, "expert_model_parallel_size", 1) or 1)
+        if self.ep_group_balance_loss_coeff > 0 and ep_size > 1:
+            from megatron.bridge.models.step3p5 import ep_balance
+
+            ep_balance.install_ep_balance_loss(
+                model,
+                coeff=self.ep_group_balance_loss_coeff,
+                num_ep_groups=ep_size,
+            )
 
         return model
 

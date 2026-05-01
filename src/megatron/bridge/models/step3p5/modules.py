@@ -55,6 +55,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from torch import Tensor, nn
 
 from megatron.bridge.utils.import_utils import safe_import_from
@@ -521,3 +522,177 @@ class Step3p5MLP(MLP):
 
         output, bias = self.linear_fc2(intermediate)
         return output, bias
+
+
+class Step3p5GroupedMLP(TEGroupedMLP):
+    """Routed-expert grouped MLP with Step-3.5 asymmetric SwiGLU clamp.
+
+    Specializes :class:`megatron.core.transformer.moe.experts.TEGroupedMLP` for
+    the same per-layer activation clamp that :class:`Step3p5MLP` applies on the
+    dense / shared path. The HF reference clamps ``silu(gate)`` (post-SiLU) and
+    ``up`` (two-sided) -- this differs from upstream's
+    ``activation_func_clamp_value`` knob which clamps the *pre-activation*
+    ``gate``. Therefore the override interposes the clamp inside
+    :meth:`bias_act_func` rather than enabling the upstream config field.
+
+    Layer membership is decided at runtime by reading ``self.layer_number``
+    against ``config.routed_swiglu_clamp_layers`` (1-indexed Megatron layer
+    number; converted to 0-indexed for HF parity). ``layer_number`` is set
+    externally after model construction by the Step-3.5 provider since the
+    upstream :class:`TEGroupedMLP` constructor does not receive it.
+
+    Parameter naming and shapes are unchanged from upstream, so the bridge
+    mappings (``FusedExpertMapping`` / ``FusedGatedExpertMapping``) continue
+    to match.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        config: TransformerConfig,
+        submodules,
+        pg_collection=None,
+    ) -> None:
+        if config.bias_activation_fusion:
+            raise ValueError(
+                "Step3p5GroupedMLP requires bias_activation_fusion=False because the asymmetric "
+                "SwiGLU clamp cannot be expressed inside the fused activation kernel."
+            )
+        if getattr(config, "use_te_activation_func", False):
+            raise ValueError(
+                "Step3p5GroupedMLP requires use_te_activation_func=False; the post-SiLU clamp "
+                "cannot be applied through the TE-fused activation path."
+            )
+        super().__init__(
+            num_local_experts=num_local_experts,
+            config=config,
+            submodules=submodules,
+            pg_collection=pg_collection,
+        )
+        # Set externally by Step3p5ModelProvider.provide() after MoELayer build.
+        self.layer_number: Optional[int] = None
+
+    def _resolve_routed_clamp_value(self) -> Optional[float]:
+        """Return the routed clamp value if this layer is in the clamp list, else None."""
+        layer_number = getattr(self, "layer_number", None)
+        if layer_number is None:
+            return None
+        layer_idx_0 = layer_number - 1
+        routed_layers = getattr(self.config, "routed_swiglu_clamp_layers", ()) or ()
+        if layer_idx_0 not in routed_layers:
+            return None
+        return float(self.config.routed_swiglu_clamp_value)
+
+    def bias_act_func(
+        self,
+        intermediate_parallel: Tensor,
+        bias_parallel: Optional[Tensor],
+        permuted_probs: Optional[Tensor],
+    ) -> Tensor:
+        """Apply Step-3.5 post-SiLU asymmetric clamp on routed-expert layers.
+
+        Mirrors the canonical fallback path in
+        :meth:`TEGroupedMLP.bias_act_func` (gated_linear_unit branch with no
+        bias-activation fusion) but interposes the Step-3.5 clamp between
+        ``silu(gate)`` and the elementwise multiply. Layers that are not in
+        ``routed_swiglu_clamp_layers`` defer to the parent implementation.
+        """
+        clamp = self._resolve_routed_clamp_value()
+        if clamp is None:
+            return super().bias_act_func(intermediate_parallel, bias_parallel, permuted_probs)
+
+        # Replicate the upstream non-fused, non-TE GLU branch (experts.py:308-324)
+        # but with HF-faithful POST-SiLU clamp ordering.
+        if bias_parallel is not None:
+            intermediate_parallel = intermediate_parallel + bias_parallel
+        gate, up = torch.chunk(intermediate_parallel, 2, dim=-1)
+        gate = self.config.activation_func(gate)
+        gate, up = _step3p5_swiglu_clamp(gate, up, clamp)
+        intermediate_parallel = gate * (up + self.config.glu_linear_offset)
+        if permuted_probs is not None:
+            original_dtype = intermediate_parallel.dtype
+            intermediate_parallel = intermediate_parallel * permuted_probs
+            intermediate_parallel = intermediate_parallel.to(original_dtype)
+        return intermediate_parallel
+
+    def forward(
+        self,
+        permuted_local_hidden_states: Tensor,
+        tokens_per_expert: Tensor,
+        permuted_probs: Tensor,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Forward with optional per-expert activation-dispersion logging.
+
+        Step-3.5 §4.1.3 / Appendix B. The pathology Muon induces in MoE is
+        invisible to training loss but visible in the dispersion of per-expert
+        FFN output norms. We compute the local-rank max-to-median ratio of
+        per-expert mean L2 norms on a configurable cadence and stash it on the
+        config for downstream metric-emission callbacks. No metric is emitted
+        when :attr:`enable_moe_dispersion_logging` is False.
+        """
+        output, output_bias = super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+        if (
+            self.training
+            and getattr(self.config, "enable_moe_dispersion_logging", False)
+            and self._should_log_dispersion()
+        ):
+            self._log_expert_norm_dispersion(output, tokens_per_expert)
+        return output, output_bias
+
+    def _should_log_dispersion(self) -> bool:
+        """Decide whether to emit a dispersion datapoint this iteration.
+
+        The cadence is read from ``config.moe_dispersion_log_every`` (default 50).
+        We don't have access to the global iteration counter here; instead each
+        instance keeps its own forward-call counter, which advances once per
+        micro-batch step and is sufficient for monitoring trends.
+        """
+        every = int(getattr(self.config, "moe_dispersion_log_every", 50))
+        if every <= 0:
+            return False
+        self._dispersion_step = getattr(self, "_dispersion_step", 0) + 1
+        return (self._dispersion_step % every) == 0
+
+    @torch.no_grad()
+    def _log_expert_norm_dispersion(self, output: Tensor, tokens_per_expert: Tensor) -> None:
+        """Compute local-rank per-expert norm dispersion and stash on config.
+
+        ``output`` is shape ``(sum_local_tokens, hidden_size)`` grouped along the
+        leading axis by ``tokens_per_expert``. We compute each local expert's
+        mean-of-row-L2-norms (in float32 to avoid overflow), then the max-to-
+        median ratio across local experts. The result is appended to
+        ``config._moe_dispersion_log[layer_number]`` for collection by an
+        external metric-emitter (training loop callback).
+        """
+        if output.numel() == 0:
+            return
+        sizes = tokens_per_expert.tolist() if isinstance(tokens_per_expert, Tensor) else list(tokens_per_expert)
+        if len(sizes) == 0 or sum(sizes) != output.shape[0]:
+            return
+        per_expert_mean_norm: list[Tensor] = []
+        cursor = 0
+        for n in sizes:
+            if n <= 0:
+                # Skip empty experts so they don't drag the median to 0.
+                cursor += n
+                continue
+            slab = output[cursor : cursor + n].float()
+            per_expert_mean_norm.append(slab.norm(dim=-1).mean())
+            cursor += n
+        if len(per_expert_mean_norm) < 2:
+            return
+        norms = torch.stack(per_expert_mean_norm)
+        max_n = norms.max()
+        median_n = norms.median().clamp(min=torch.finfo(norms.dtype).tiny)
+        ratio = (max_n / median_n).item()
+
+        log_dict = getattr(self.config, "_moe_dispersion_log", None)
+        if log_dict is None:
+            log_dict = {}
+            self.config._moe_dispersion_log = log_dict
+        layer_key = self.layer_number if self.layer_number is not None else -1
+        log_dict[layer_key] = {
+            "max": max_n.item(),
+            "median": median_n.item(),
+            "max_over_median": ratio,
+        }
